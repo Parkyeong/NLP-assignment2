@@ -1,17 +1,9 @@
-import pandas as pd
-import torch
 import re
-from transformers import T5Tokenizer, T5ForConditionalGeneration
+import torch
+import pandas as pd
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-# Load tokenizer & model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-tokenizer = T5Tokenizer.from_pretrained("best_model_t5")
-model = T5ForConditionalGeneration.from_pretrained("best_model_t5")
-model.to(device)
-model.eval()
-
-# Data Preparation
+# Data Preparation Functions
 def prepare_dataset(data_path):
     df = pd.read_json(data_path, lines=True)
     df = df.rename(columns={'id': 'review_id'})
@@ -31,11 +23,7 @@ def clean_text_for_generation(text):
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
-test_df = prepare_dataset("hotel_reviews_test.JSON")
-test_df['text'] = test_df['text'].apply(clean_text_for_generation)
-
-# Prompt / Build Prompt 
-def build_prompt(row, model_type="t5"):
+def build_prompt(row, model_type="gpt2"):
     def describe_score(field, score):
         if score >= 4:
             return f"{field} was excellent ({score})"
@@ -46,6 +34,7 @@ def build_prompt(row, model_type="t5"):
 
     core_fields = ["overall", "cleanliness", "service", "value", "rooms"]
     optional_fields = ["location", "sleep_quality"]
+
     rating_strs = []
     for field in core_fields + optional_fields:
         score = row.get(field)
@@ -64,41 +53,72 @@ def build_prompt(row, model_type="t5"):
         if pd.notna(location) and location != "":
             context_parts.append(f"guest location: {location}")
 
-    prompt = ""
-    if rating_strs:
-        prompt += "The guest gave the following feedback: " + "; ".join(rating_strs) + "."
-    if context_parts:
-        prompt += " Additional context: " + ", ".join(context_parts) + "."
-    prompt += " Based on this information, write a possible text:"
-
+    if model_type == "t5":
+        prompt = ""
+        if rating_strs:
+            prompt += "The guest gave the following feedback: " + "; ".join(rating_strs) + "."
+        if context_parts:
+            prompt += " Additional context: " + ", ".join(context_parts) + "."
+        prompt += " Based on this information, write a possible text:"
+    elif model_type == "gpt2":
+        prompt = ""
+        if rating_strs:
+            prompt += "A customer gave these ratings: " + "; ".join(rating_strs) + "."
+        if context_parts:
+            prompt += " Context: " + ", ".join(context_parts) + "."
+        prompt += " Here's a possible review they might have written: "
+    else:
+        raise ValueError("Unsupported model_type. Choose 't5' or 'gpt2'.")
     return prompt
 
-# Command Line Interface
+# Load Model and Data
+print("Loading model and tokenizer...")
+tokenizer = GPT2Tokenizer.from_pretrained("best_model_gpt2", padding_side="left")
+model = GPT2LMHeadModel.from_pretrained("best_model_gpt2")
+tokenizer.pad_token = tokenizer.eos_token
+model.config.pad_token_id = tokenizer.pad_token_id
+model.to("cuda" if torch.cuda.is_available() else "cpu")
+model.eval()
+
+print("Loading test dataset...")
+test_df = prepare_dataset('hotel_reviews_test.JSON')
+test_df['text'] = test_df['text'].apply(clean_text_for_generation)
+
+# User Input Loop
 while True:
-    print("\nWelcome! You can generate a review by entering a review_id from the test set.")
-    review_id = input("Please enter review_id (or type 'exit' to quit): ").strip()
-
-    if review_id.lower() == 'exit':
-        print("Goodbye!")
-        break
-
-    if review_id not in test_df.index:
-        print(f"Error: review_id '{review_id}' not found in test set.")
-        try_again = input("Do you want to try another review_id? (y/n): ").strip().lower()
-        if try_again != 'y':
-            break
-        continue
-
-    # Build Prompt
-    row = test_df.loc[review_id]
-    prompt = build_prompt(row, model_type='t5')
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, padding=True).to(device)
-
-    # Generate Review
     try:
+        print("\nWelcome! You can generate a review by entering a review_id from the test set.")
+        review_id = input("Please enter review_id (or type 'exit' to quit): ").strip()
+        
+        #Exit condition
+        if review_id.lower() == 'exit':
+            print("Goodbye!")
+            break
+        
+        # Ensure review_id is an integer
+        try:
+            review_id = int(review_id)
+        except ValueError:
+            print("Error: review_id should be an integer. Please try again.")
+            continue
+
+        if review_id not in test_df.index:
+            print(f"Error: review_id '{review_id}' not found in test set.")
+            continue
+        
+        # Retrieve data and build prompt
+        row = test_df.loc[review_id]
+        prompt = build_prompt(row, model_type='gpt2')
+        # Tokenize and prepare input
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, padding=True).to(model.device)
+
+        # Generate text without gradient
         with torch.no_grad():
-            output_ids = model.generate(**inputs, max_length=100)
+            output_ids = model.generate(**inputs, max_new_tokens=128, pad_token_id=tokenizer.pad_token_id)
             output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        print(f"\nPredicted review text for review_id '{review_id}':\n{output}")
+
+        print(output)
+
     except Exception as e:
-        print(f"Generation failed: {e}")
+        print(f"Unexpected error: {e}")
+        continue
